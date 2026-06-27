@@ -164,46 +164,112 @@ class UnifiedGatewayClient:
 - [LiteLLM: Proxy Server Documentation](https://docs.litellm.ai/docs/proxy_server)
 - [Portkey: AI Gateway Feature List](https://portkey.ai/features/ai-gateway)
 
-## FastAPI Backend with Server-Sent Events (SSE) Streaming
+## The AI Backend with FastAPI
 
 ### Definition & The Problem It Solves
-Server-Sent Events (SSE) is a web standard that allows servers to stream real-time updates to browsers over a single HTTP connection. In AI apps, waiting for the model to generate a full 500-token response before sending it to the client takes 5-10 seconds, which is a terrible user experience. SSE solves this: as the serving engine generates each token, the FastAPI backend streams it to the client instantly, allowing the browser to render words as they are generated.
+FastAPI is an asynchronous Python web framework designed to handle high-concurrency connections. Traditional synchronous web frameworks (like Flask or Django) block the execution thread for each incoming request. In AI engineering, where model API calls or local generation steps take several seconds, hosting an LLM backend on Flask causes the server's thread pool to exhaust quickly, causing request timeouts for subsequent users. FastAPI solves this by running an event loop: it releases execution threads during network wait states (like waiting for OpenAI API bytes), allowing a single server instance to process thousands of concurrent users waiting for model outputs. It also integrates with Pydantic for schema validations and supports StreamingResponse to push tokens to the frontend in real time using Server-Sent Events (SSE).
 
-I learned this when testing our writing app. Users assumed the app was broken and refreshed the page because of the initial 5-second silence. Implementing SSE streaming made the app feel fast and responsive.
+When I first deployed a chatbot backend on Flask, three concurrent users generating responses froze the API for everyone else. Rewriting the routing handlers to use FastAPI's async endpoints immediately restored throughput.
 
 ### The Real-World Analogy
-I like to compare SSE streaming to watching a live ticker tape. Instead of a printing house printing a whole newspaper and mailing it to your house at the end of the day, a ticker tape printer prints each letter on a paper strip the second it is typed at the news station, allowing you to read the news word by word.
+I like to compare Flask to a restaurant with a single waiter who takes your order, walks into the kitchen, stands next to the stove waiting for the cook to prepare your steak (a blocking API call), and only returns to serve other tables once your meal is ready. FastAPI is like a waiter who takes your order, passes it to the kitchen, and immediately goes to assist other tables while your food is cooking, returning to serve you once the cook rings the bell.
 
 ### The Code
 ```python
-# FastAPI endpoint streaming tokens to the client using Server-Sent Events (SSE)
+# FastAPI production backend demonstrating Pydantic requests, SSE streaming,
+# background tasks for long-running agents, and Dockerfile containerization.
 import asyncio
-from fastapi import FastAPI
+import json
+from uuid import uuid4
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 
 app = FastAPI()
 
-async def token_generator(prompt: str):
-    # Simulates streaming tokens from a model generator
-    words = f"This is the streamed response to: {prompt}".split()
-    for word in words:
-        # SSE format requires prepending data: to each message chunk
-        yield f"data: {json.dumps({'token': word})}\n\n"
-        await asyncio.sleep(0.15) # Simulate token generation delay
+# InMemory database simulating task status tracking
+task_store = {}
+
+# 1. Pydantic request model for input validation and structured output mapping
+class ChatRequest(BaseModel):
+    prompt: str = Field(..., min_length=1, max_length=1000)
+    temperature: float = Field(default=0.7, ge=0.0, le=1.0)
+
+class TaskStatusResponse(BaseModel):
+    task_id: str
+    status: str
+    result: str | None = None
+
+# Helper simulating an agent execution loop
+async def run_agent_workflow(task_id: str, prompt: str):
+    task_store[task_id] = {"status": "processing", "result": None}
+    
+    # Simulate multi-step research agent steps
+    for step in range(3):
+        await asyncio.sleep(2) # Simulate tool execution latency
         
+    task_store[task_id] = {
+        "status": "completed",
+        "result": f"Final agentic research report for: '{prompt}'"
+    }
+
+# 2. Async endpoint streaming tokens using Server-Sent Events (SSE)
+async def event_generator(prompt: str):
+    # Simulates streaming tokens from a model API response
+    tokens = f"Transmitted tokens response for prompt: {prompt}".split()
+    for token in tokens:
+        # SSE messages must begin with 'data: ' and end with double newlines
+        yield f"data: {json.dumps({'token': token})}\n\n"
+        await asyncio.sleep(0.1)
     yield "data: [DONE]\n\n"
 
-@app.get("/stream")
-async def stream_tokens(prompt: str):
-    # StreamingResponse sets transfer-encoding chunked headers automatically
-    return StreamingResponse(token_generator(prompt), media_type="text/event-stream")
+@app.post("/chat/stream")
+async def chat_stream(request: ChatRequest):
+    return StreamingResponse(
+        event_generator(request.prompt),
+        media_type="text/event-stream"
+    )
+
+# 3. Background task endpoint for long-running workflows (Polling Pattern)
+@app.post("/agent/run", response_model=TaskStatusResponse)
+async def start_agent_task(request: ChatRequest, background_tasks: BackgroundTasks):
+    task_id = str(uuid4())
+    task_store[task_id] = {"status": "queued", "result": None}
+    
+    # Hand off execution to background workers without blocking HTTP response
+    background_tasks.add_task(run_agent_workflow, task_id, request.prompt)
+    return TaskStatusResponse(task_id=task_id, status="queued")
+
+@app.get("/agent/status/{task_id}", response_model=TaskStatusResponse)
+async def get_agent_status(task_id: str):
+    if task_id not in task_store:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task_data = task_store[task_id]
+    return TaskStatusResponse(
+        task_id=task_id,
+        status=task_data["status"],
+        result=task_data["result"]
+    )
+
+# 4. Containerization blueprint: Dockerfile
+# To run this container in production alongside model weights:
+#
+# FROM python:3.11-slim
+# WORKDIR /app
+# COPY requirements.txt .
+# RUN pip install --no-cache-dir -r requirements.txt
+# COPY . .
+# # Expose port and run server
+# EXPOSE 8000
+# CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
 ### Interview Questions
-- How does the `text/event-stream` media type differ from standard `application/json` responses?
-- What are the differences between WebSockets and Server-Sent Events for streaming model responses?
-- How do you handle connection drops on the client side when receiving SSE streams?
+- Why do blocking libraries (like standard requests) negate the performance benefits of FastAPI's async endpoints?
+- Explain how `BackgroundTasks` in FastAPI differs from dedicated task queues like Celery or RabbitMQ.
+- How do you parse and validate nested Pydantic models when mapping JSON data payloads?
 
 ### References
-- [FastAPI: Streaming Responses](https://fastapi.tiangolo.com/advanced/custom-response/#streamingresponse)
-- [MDN: Using server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events)
+- [FastAPI: Concurrency and async/await](https://fastapi.tiangolo.com/async/)
+- [Uvicorn: ASGI Web Server](https://www.uvicorn.org/)
+
